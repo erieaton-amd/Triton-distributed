@@ -26,7 +26,7 @@ compile () {
     local base=${base#rocshmem_}
     local bc_file="rocshmem_${base}.bc"
     ALL_BC+=("${bc_file}")
-    ${ROCM_CXX} -x hip --cuda-device-only -std=c++20  -emit-llvm  --offload-arch=${ARCH} -ggdb \
+    ${ROCM_CXX} -x hip --cuda-device-only -std=c++20  -emit-llvm  --offload-arch=${ARCH} \
         ${DEFINES} \
         -I${ROCSHMEM_INSTALL_DIR}/include/rocshmem \
         -I${ROCSHMEM_INSTALL_DIR}/include \

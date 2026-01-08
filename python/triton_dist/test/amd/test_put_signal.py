@@ -62,4 +62,6 @@ for i in range(elems):
 print(message[0], sig_addr)
 print("Test pass: ", passed)
 
+torch.distributed.barrier()
+
 finalize_distributed()
