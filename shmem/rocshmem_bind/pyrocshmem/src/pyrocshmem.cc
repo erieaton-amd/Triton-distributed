@@ -133,6 +133,12 @@ PYBIND11_MODULE(_pyrocshmem, m) {
         [](intptr_t dest, const intptr_t source, size_t nelems, int pe) {
           rocshmem_putmem((void *)dest, (const void *)source, nelems, pe);
         });
+  m.def("rocshmem_putmem_signal_on_stream",
+        [](intptr_t dest, intptr_t source, size_t nelems, intptr_t sig_addr,
+           uint64_t signal, int sig_op, int pe, intptr_t stream) {
+            rocshmem_putmem_signal_on_stream((void *)dest, (const void*)source,
+              nelems, (uint64_t *)sig_addr, signal, sig_op, pe, (hipStream_t)stream);
+        });
   m.def("rocshmem_getmem",
         [](intptr_t dest, const intptr_t source, size_t nelems, int pe) {
           rocshmem_getmem((void *)dest, (const void *)source, nelems, pe);

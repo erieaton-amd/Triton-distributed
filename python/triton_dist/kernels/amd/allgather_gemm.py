@@ -34,6 +34,7 @@ from triton.runtime.driver import driver
 
 import triton_dist
 from triton_dist.language.extra.language_extra import st
+from triton_dist.language.extra import libshmem_device
 from hip import hip
 from triton_dist.utils import HIP_CHECK
 from typing import Optional, List
@@ -332,29 +333,19 @@ def cp_engine_producer_all_gather_full_mesh_push_multi_stream(
             # src = local_tensor[M_src_start_pos:M_src_end_pos, :]
             chunk_size = min(M_PER_CHUNK, M_per_rank - M_src_start_pos)
             src_ptr = local_tensor.data_ptr() + M_src_start_pos * N * data_elem_size
-            dst_ptr = remote_tensor_buffers[remote_rank].data_ptr() + M_dst_start_pos * N * data_elem_size
+            dst_ptr = remote_tensor_buffers[rank].data_ptr() + M_dst_start_pos * N * data_elem_size
             nbytes = chunk_size * N * data_elem_size
-            cp_res = hip.hipMemcpyAsync(
+
+            pyrocshmem.rocshmem_putmem_signal_on_stream(
                 dst_ptr,
                 src_ptr,
                 nbytes,
-                hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU,
-                ag_stream.cuda_stream,
+                barrier_buffers[rank].data_ptr() + chunk_pos * barrier_elem_size,
+                1,
+                libshmem_device.ROCSHMEM_SIGNAL_SET,
+                remote_rank,
+                ag_stream.cuda_stream
             )
-            HIP_CHECK(cp_res)
-            """
-                Why use memcpy to set signal:
-                    Because driver API(waitValue/writeValue) on AMD will affect the perf of gemm. Memcpy also takes less than 5us.
-            """
-            # set_signal(barrier_buffers[remote_rank][chunk_pos].data_ptr(), 1, ag_stream)
-            cp_res = hip.hipMemcpyAsync(
-                barrier_buffers[remote_rank].data_ptr() + chunk_pos * barrier_elem_size,
-                one.data_ptr(),
-                barrier_elem_size,
-                hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU,
-                ag_stream.cuda_stream,
-            )
-            HIP_CHECK(cp_res)
 
 
 def copy_kernel_producer_all_gather(
@@ -548,12 +539,13 @@ def swizzle_ag_gemm_imperfect(original_pid_m, M, rank, world_size, CHUNK_SIZE_M:
 
 
 @triton.heuristics({'EVEN_K': lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0})
-@triton.jit(do_not_specialize=["rank"])
+@triton_dist.jit(do_not_specialize=["rank"])
 def kernel_consumer_gemm_persistent(A, B, C, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
                                     rank, world_size: tl.constexpr, barrier_ptr, BLOCK_SIZE_M: tl.constexpr,
                                     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
                                     M_PER_CHUNK: tl.constexpr, NUM_SMS: tl.constexpr, NUM_XCDS: tl.constexpr,
-                                    EVEN_K: tl.constexpr):
+                                    EVEN_K: tl.constexpr, ctx):
+    libshmem_device.set_rocshmem_ctx(ctx)
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = (pid % NUM_XCDS) * (NUM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
@@ -932,7 +924,7 @@ def create_ag_gemm_intra_node_context(max_M, N, K, input_dtype: torch.dtype, out
     workspaces = pyrocshmem.rocshmem_create_tensor_list_intra_node([max_M, K], dtype)
 
     chunks_per_rank = (M_per_rank + M_PER_CHUNK - 1) // M_PER_CHUNK
-    barriers = pyrocshmem.rocshmem_create_tensor_list_intra_node([num_ranks * chunks_per_rank], torch.int32)
+    barriers = pyrocshmem.rocshmem_create_tensor_list_intra_node([num_ranks * chunks_per_rank], torch.int64)
     barriers[rank].fill_(0)
 
     comm_bufs = pyrocshmem.rocshmem_create_tensor_list_intra_node([num_ranks], torch.int32)
@@ -951,7 +943,7 @@ def create_ag_gemm_intra_node_context(max_M, N, K, input_dtype: torch.dtype, out
             _ag_streams = [torch.cuda.Stream(priority=-1) for i in range(num_ranks)]
     else:
         _ag_streams = ag_streams
-    one = torch.ones((1024, ), dtype=torch.int32, device=torch.cuda.current_device())
+    one = torch.ones((1024, ), dtype=torch.int64, device=torch.cuda.current_device())
 
     ret = AllGatherGEMMTensorParallelContext(
         rank=rank,
@@ -1103,10 +1095,11 @@ def ag_gemm_intra_node_op(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, ctx
             grid = (NUM_SMS, )
             full_input = ctx.workspace_tensors[ctx.rank][:M]
 
+            rctx = pyrocshmem.rocshmem_get_device_ctx()
             kernel_consumer_gemm_persistent[grid](full_input, B, C, M, N_per_rank, K, full_input.stride(0),
                                                   full_input.stride(1), B.stride(1), B.stride(0), C.stride(0),
                                                   C.stride(1), ctx.rank, ctx.num_ranks, ctx.barrier_tensors[ctx.rank],
-                                                  M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS,
+                                                  M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS, ctx=rctx,
                                                   **gemm_config.all_kwargs())
         else:
             raise NotImplementedError("Non-persistent gemm is not yet supported")
@@ -1158,10 +1151,11 @@ def gemm_only(A: torch.Tensor, B: torch.Tensor, ctx: AllGatherGEMMTensorParallel
     grid = (min(NUM_SMS, total_tiles), )
     full_input = ctx.workspace_tensors[ctx.rank][:M]
 
+    rctx = pyrocshmem.rocshmem_get_device_ctx()
     kernel_consumer_gemm_persistent[grid](full_input, B, C, M, N_per_rank, K,
                                           full_input.stride(0), full_input.stride(1), B.stride(1), B.stride(0),
                                           C.stride(0), C.stride(1), ctx.rank, ctx.num_ranks,
-                                          ctx.barrier_tensors[ctx.rank], M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS,
+                                          ctx.barrier_tensors[ctx.rank], M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS, ctx=rctx
                                           **gemm_config.all_kwargs())
     return C
 
