@@ -138,7 +138,7 @@ def copy_kernel_2d(
 
                 old = tl.atomic_add(chunk_counters_ptr + prev_global_chunk_idx, local_count)
                 if old + local_count == prev_chunk_total_blocks:
-                    target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int32))
+                    target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int64))
                     st(
                         target_barrier_ptr + rank * NUM_CHUNKS_PER_RANK_M +
                         (prev_global_chunk_idx - target_rank * NUM_CHUNKS_PER_RANK_M), 1, semantic="release",
@@ -165,7 +165,7 @@ def copy_kernel_2d(
 
         old = tl.atomic_add(chunk_counters_ptr + prev_global_chunk_idx, local_count)
         if old + local_count == last_chunk_total_blocks:
-            target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int32))
+            target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int64))
             st(
                 target_barrier_ptr + rank * NUM_CHUNKS_PER_RANK_M +
                 (prev_global_chunk_idx - target_rank * NUM_CHUNKS_PER_RANK_M), 1, semantic="release", scope="system")
@@ -262,7 +262,7 @@ def copy_kernel_2d_pull(
 
                 old = tl.atomic_add(chunk_counters_ptr + prev_global_chunk_idx, local_count)
                 if old + local_count == prev_chunk_total_blocks:
-                    target_barrier_ptr = tl.load(barrier_ptrs + rank).to(tl.pointer_type(tl.int32))
+                    target_barrier_ptr = tl.load(barrier_ptrs + rank).to(tl.pointer_type(tl.int64))
                     chunk_idx_in_src_rank_m = prev_global_chunk_idx - src_rank * NUM_CHUNKS_PER_RANK_M
                     signal_ptr = target_barrier_ptr + src_rank * NUM_CHUNKS_PER_RANK_M + chunk_idx_in_src_rank_m
                     st(signal_ptr, 1, semantic="release", scope="system")
@@ -288,7 +288,7 @@ def copy_kernel_2d_pull(
 
         old = tl.atomic_add(chunk_counters_ptr + prev_global_chunk_idx, local_count)
         if old + local_count == last_chunk_total_blocks:
-            target_barrier_ptr = tl.load(barrier_ptrs + rank).to(tl.pointer_type(tl.int32))
+            target_barrier_ptr = tl.load(barrier_ptrs + rank).to(tl.pointer_type(tl.int64))
             chunk_idx_in_src_rank_m = prev_global_chunk_idx - src_rank * NUM_CHUNKS_PER_RANK_M
             signal_ptr = target_barrier_ptr + src_rank * NUM_CHUNKS_PER_RANK_M + chunk_idx_in_src_rank_m
             st(signal_ptr, 1, semantic="release", scope="system")
@@ -740,7 +740,7 @@ def kernel_fused_ag_gemm(A, localA,  # Local tensor for this rank [M_per_rank, K
 
                     old = tl.atomic_add(chunk_counters_ptr + prev_global_chunk_idx, local_count)
                     if old + local_count == prev_chunk_total_blocks:
-                        target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int32))
+                        target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int64))
                         st(
                             target_barrier_ptr + rank * NUM_CHUNKS_PER_RANK_M +
                             (prev_global_chunk_idx - target_rank * NUM_CHUNKS_PER_RANK_M), 1, semantic="release",
@@ -767,7 +767,7 @@ def kernel_fused_ag_gemm(A, localA,  # Local tensor for this rank [M_per_rank, K
 
             old = tl.atomic_add(chunk_counters_ptr + prev_global_chunk_idx, local_count)
             if old + local_count == last_chunk_total_blocks:
-                target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int32))
+                target_barrier_ptr = tl.load(barrier_ptrs + target_rank).to(tl.pointer_type(tl.int64))
                 st(
                     target_barrier_ptr + rank * NUM_CHUNKS_PER_RANK_M +
                     (prev_global_chunk_idx - target_rank * NUM_CHUNKS_PER_RANK_M), 1, semantic="release",
