@@ -544,8 +544,7 @@ def kernel_consumer_gemm_persistent(A, B, C, M, N, K, stride_am, stride_ak, stri
                                     rank, world_size: tl.constexpr, barrier_ptr, BLOCK_SIZE_M: tl.constexpr,
                                     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
                                     M_PER_CHUNK: tl.constexpr, NUM_SMS: tl.constexpr, NUM_XCDS: tl.constexpr,
-                                    EVEN_K: tl.constexpr, ctx):
-    libshmem_device.set_rocshmem_ctx(ctx)
+                                    EVEN_K: tl.constexpr):
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = (pid % NUM_XCDS) * (NUM_SMS // NUM_XCDS) + (pid // NUM_XCDS)
@@ -814,8 +813,8 @@ def kernel_fused_ag_gemm(A, localA,  # Local tensor for this rank [M_per_rank, K
                 start_chunk_idx = row_to_chunk_idx(block_m_start, M_PER_CHUNK, M_per_rank, chunks_per_rank)
                 end_chunk_idx = row_to_chunk_idx(block_m_end - 1, M_PER_CHUNK, M_per_rank, chunks_per_rank)
                 signal_count = end_chunk_idx - start_chunk_idx + 1
-                token = dl.wait(barrier_ptr + start_chunk_idx, signal_count, "sys", "relaxed", waitValue=1)
-                A = dl.consume_token(A, token)
+                for i in range(signal_count):
+                    libshmem_device.signal_wait_until(barrier_ptr + start_chunk_idx + i, libshmem_device.ROCSHMEM_CMP_EQ, 1)
 
             rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
             rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -1095,11 +1094,10 @@ def ag_gemm_intra_node_op(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, ctx
             grid = (NUM_SMS, )
             full_input = ctx.workspace_tensors[ctx.rank][:M]
 
-            rctx = pyrocshmem.rocshmem_get_device_ctx()
             kernel_consumer_gemm_persistent[grid](full_input, B, C, M, N_per_rank, K, full_input.stride(0),
                                                   full_input.stride(1), B.stride(1), B.stride(0), C.stride(0),
                                                   C.stride(1), ctx.rank, ctx.num_ranks, ctx.barrier_tensors[ctx.rank],
-                                                  M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS, ctx=rctx,
+                                                  M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS,
                                                   **gemm_config.all_kwargs())
         else:
             raise NotImplementedError("Non-persistent gemm is not yet supported")
@@ -1151,11 +1149,10 @@ def gemm_only(A: torch.Tensor, B: torch.Tensor, ctx: AllGatherGEMMTensorParallel
     grid = (min(NUM_SMS, total_tiles), )
     full_input = ctx.workspace_tensors[ctx.rank][:M]
 
-    rctx = pyrocshmem.rocshmem_get_device_ctx()
     kernel_consumer_gemm_persistent[grid](full_input, B, C, M, N_per_rank, K,
                                           full_input.stride(0), full_input.stride(1), B.stride(1), B.stride(0),
                                           C.stride(0), C.stride(1), ctx.rank, ctx.num_ranks,
-                                          ctx.barrier_tensors[ctx.rank], M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS, ctx=rctx
+                                          ctx.barrier_tensors[ctx.rank], M_PER_CHUNK=ctx.M_PER_CHUNK, NUM_SMS=NUM_SMS
                                           **gemm_config.all_kwargs())
     return C
 
