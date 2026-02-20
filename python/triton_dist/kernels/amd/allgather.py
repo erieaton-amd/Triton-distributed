@@ -31,6 +31,7 @@ import triton
 import triton.language as tl
 import triton_dist
 import triton_dist.language as dl
+from triton_dist.kernels.allgather import AllGatherMethod
 from triton_dist.kernels.amd.common_ops import (barrier_all_kernel, barrier_all_on_stream,
                                                 barrier_on_this_grid)
 from triton_dist.kernels.amd.memcpy import memcpy_async_kernel

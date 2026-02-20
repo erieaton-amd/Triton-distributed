@@ -26,7 +26,6 @@
 """
 
 import functools
-from enum import Enum
 from typing import List
 
 import nvshmem.bindings.nvshmem as pynvshmem
@@ -37,20 +36,11 @@ from triton_dist.utils import cudart
 import triton.language as tl
 import triton_dist
 from triton_dist.language.extra.language_extra import __syncthreads, tid
+from triton_dist.kernels.allgather import AllGatherMethod
 from triton_dist.kernels.nvidia.common_ops import _set_signal_cuda, _wait_eq_cuda
 from triton_dist.language.extra import libshmem_device
 from triton_dist.utils import (CUDA_CHECK, NVSHMEM_SIGNAL_DTYPE, get_triton_dist_world, has_fullmesh_nvlink,
                                get_group_numa_world_size, nvshmem_barrier_all_on_stream, sleep_async)
-
-
-class AllGatherMethod(Enum):
-    Auto = 0
-    All2All_IntraNode = 1
-    All2All_InterNode = 2
-    Ring1D_IntraNode = 3
-    Ring2D_IntraNode = 4
-    Ring1D_InterNode = 5
-    Ring2D_InterNode = 6
 
 
 @functools.lru_cache()
