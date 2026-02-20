@@ -360,6 +360,11 @@ def broadcast_block(team, dest, source, nelems, pe_root):
     ...
 
 
+@_shmem_module.dispatch
+def broadcast_wg(team, dest, source, nelems, pe_root):
+    ...
+
+
 # DON'T USE THIS. NVSHMEM 3.2.5 does not implement this
 @_shmem_module.dispatch
 def fcollectmem(team, dest, source, nelems):
@@ -458,6 +463,11 @@ def team_translate_pe(src_team, pe_in_src_team, dest_team):
     ...
 
 
+@_shmem_module.dispatch
+def wg_team_create_ctx(team, ctx):
+    ...
+
+
 # class nvshmemi_cmp_type(Enum):
 NVSHMEM_CMP_EQ = 0
 NVSHMEM_CMP_NE = 1
@@ -543,3 +553,6 @@ MORI_AMO_FETCH_XOR = 19
 MORI_AMO_SWAP = 20
 MORI_AMO_COMPARE_SWAP = 21
 MORI_AMO_OP_SENTINEL = sys.maxsize
+
+import triton.language as tl
+ctx_t = tl.core.tuple_type([tl.core.dtype("uint64"), tl.core.dtype("uint64")], ["ctx", "team"])

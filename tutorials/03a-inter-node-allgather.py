@@ -55,6 +55,7 @@ class AllGatherContext:
     num_ranks: int
     num_nodes: int
     symm_signals: torch.Tensor
+    teams: torch.Tensor
     signal_value: int = 15
     max_buffer_size: int = 2 * 32 * 1024 * 1024
 
@@ -96,15 +97,43 @@ def all_gather_push_1d_kernel(symm_ptr, bytes_per_rank, symm_flag,
             libshmem_device.ROCSHMEM_SIGNAL_SET,
             peer,
         )  # write and tell peer remote that remote copy is done
+        
+@triton_dist.jit(do_not_specialize=["rank", "signal_value"])
+def all_gather_push_1d_kernel_v2(symm_ptr, bytes_per_rank, teams,
+                              WORLD_SIZE: tl.constexpr, rank, ctx):
+    libshmem_device.set_rocshmem_ctx(ctx)
+    #pid = tl.program_id(0)
+    #thread_idx = tid(0)
+    #new_ctx = tl.zeros((2,), dtype=tl.uint64)
+    #libshmem_device.wg_team_create_ctx(teams[rank], new_ctx)
+    
+    libshmem_device.broadcast_wg(
+        #new_ctx,
+        tl.cast(teams[rank], tl.pointer_type(tl.uint64), bitcast=True),
+        tl.cast(symm_ptr, tl.pointer_type(tl.int8)) +
+        rank * bytes_per_rank,
+        tl.cast(symm_ptr, tl.pointer_type(tl.int8)) +
+        rank * bytes_per_rank,
+        bytes_per_rank, rank)
 
 
 def all_gather_push_1d(ctx: AllGatherContext, symm_buffer: torch.Tensor):
     ctx.signal_value += 1
     rctx = pyrocshmem.rocshmem_get_device_ctx()
-    all_gather_push_1d_kernel[(ctx.num_ranks, )](
-        symm_buffer, symm_buffer.nbytes // ctx.num_ranks,
-        ctx.symm_signals[ctx.signal_value % 2], ctx.num_ranks, ctx.rank,
-        ctx.signal_value, rctx)
+
+    for i in range(ctx.num_ranks):
+        #print(teams.data_ptr())
+        pyrocshmem.rocshmem_team_split_strided(ctx.teams.data_ptr() + i*ctx.teams.element_size(), ctx.num_ranks)
+        print(ctx.teams[i])
+
+    all_gather_push_1d_kernel_v2[(ctx.num_ranks, )](
+        symm_buffer,
+        symm_buffer.nbytes // ctx.num_ranks,
+        ctx.teams,
+        ctx.num_ranks,
+        ctx.rank,
+        rctx
+    )
     return symm_buffer
 
 
@@ -192,6 +221,7 @@ ctx = AllGatherContext(
         pyrocshmem.rocshmem_create_tensor((1, ), NVSHMEM_SIGNAL_DTYPE)
         for _ in range(2)
     ],
+    teams = pyrocshmem.rocshmem_create_tensor((WORLD_SIZE,), torch.int64),
     signal_value=10,
 )
 print("using push 1d...")
@@ -203,6 +233,8 @@ perf_ag(
 )
 
 del symm_ag_buffer
-del ctx.symm_signals
+del ctx.teams
+for i in reversed(range(len(ctx.symm_signals))):
+    del ctx.symm_signals[i]
 
 finalize_distributed()

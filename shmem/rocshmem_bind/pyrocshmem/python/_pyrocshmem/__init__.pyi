@@ -118,6 +118,8 @@ def rocshmem_getmem(dest: np.intp, source: np.intp, nelems: int, pe: int):
 def rocshmem_putmem(dest: np.intp, source: np.intp, nelems: int, pe: int):
     ...
 
+def rocshmem_team_split_strided(team: np.intp, n_pes: int):
+    ...
 
 ## TODO: add host side API
 # def rocshmem_putmem_signal(dest: np.intp, source: np.intp, nelems: int, sig_addr: np.intp, signal: int, sig_op: int, pe: int):

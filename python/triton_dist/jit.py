@@ -82,7 +82,7 @@ def shmem_kernel_module_init_hook(*args, **kwargs) -> None:
                 ctx = pyrocshmem.rocshmem_get_device_ctx()
                 ctx_tensor = torch.tensor([ctx], dtype=torch.int64)
                 # update the device `ROCSHMEM_CTX_DEFAULT` struct's `ctx_opaque` field in the kernel module.
-                cp_res = hip.hipMemcpy(res[1], ctx_tensor.data_ptr(), ctx_opaque_bytes,
+                cp_res = hip.hipMemcpy(res[1], ctx_tensor.data_ptr(), ctx_opaque_bytes*2,
                                        hip.hipMemcpyKind.hipMemcpyHostToDevice)
                 HIP_CHECK(cp_res)
             else:

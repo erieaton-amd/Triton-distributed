@@ -198,4 +198,14 @@ __device__ void __attribute__((visibility("default")))
 rocshmem_fence_wave_wrapper() {
   rocshmem_fence();
 }
+
+__device__ void __attribute__((visibility("default")))
+rocshmem_broadcast_wrapper(void *team, void *dest, const void *source, size_t nelems, int32_t pe_root) {
+  rocshmem_ctx_char_broadcast_wg(ROCSHMEM_CTX_DEFAULT, static_cast<rocshmem_team_t>(team), static_cast<char *>(dest), static_cast<const char *>(source), nelems, pe_root);
+}
+
+__device__ void __attribute__((visibility("default")))
+rocshmem_wg_team_create_ctx_wrapper(void *team, void *ctx) {
+  rocshmem_wg_team_create_ctx(static_cast<rocshmem_team_t>(team), 8, reinterpret_cast<rocshmem_ctx_t *>(ctx));
+}
 }

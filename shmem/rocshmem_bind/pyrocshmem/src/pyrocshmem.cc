@@ -137,4 +137,13 @@ PYBIND11_MODULE(_pyrocshmem, m) {
         [](intptr_t dest, const intptr_t source, size_t nelems, int pe) {
           rocshmem_getmem((void *)dest, (const void *)source, nelems, pe);
         });
+
+  m.def("rocshmem_team_split_strided",
+        [](intptr_t team, int n_pes){
+          rocshmem_team_split_strided(ROCSHMEM_TEAM_WORLD, 0, 1, n_pes, nullptr, 0, reinterpret_cast<rocshmem_team_t *>(team));
+        });
+  m.def("rocshmem_team_destroy",
+        [](intptr_t team){
+          rocshmem_team_destroy(*reinterpret_cast<rocshmem_team_t *>(team));
+        });
 }

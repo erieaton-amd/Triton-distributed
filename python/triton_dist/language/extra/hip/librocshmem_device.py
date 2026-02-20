@@ -28,6 +28,7 @@ from triton_dist.language.core import extern_call
 
 pi_u64_t = tl.core.pointer_type(tl.core.dtype("uint64"))
 pi_i64_t = tl.core.pointer_type(tl.core.dtype("int64"))
+ctx_t = tl.core.tuple_type([pi_u64_t, pi_u64_t], ["ctx", "team"])
 
 # ROCSHMEM_CMPS (enum)
 ROCSHMEM_CMP_EQ = 0
@@ -440,4 +441,44 @@ def fence(_semantic=None):
         },
         is_pure=False,
         _semantic=_semantic,
+    )
+
+
+@core.extern
+def broadcast_wg(team, dest, source, nelems, pe_root, _semantic=None):
+    return extern_call(
+        "librocshmem_device",
+        "",
+        [
+            #tl.cast(ctx, pi_u64_t, _semantic=_semantic),
+            tl.cast(team, pi_u64_t, _semantic=_semantic),
+            tl.cast(dest, pi_u64_t, _semantic=_semantic),
+            tl.cast(source, pi_u64_t, _semantic=_semantic),
+            tl.cast(nelems, tl.uint64, _semantic=_semantic),
+            tl.cast(pe_root, tl.int32, _semantic=_semantic),
+        ],
+        {
+            (pi_u64_t, pi_u64_t, pi_u64_t, tl.uint64, tl.int32): (
+                "rocshmem_broadcast_wrapper",
+                (),
+            ),
+        }, is_pure=False, _semantic=_semantic
+    )
+
+@core.extern
+def wg_team_create_ctx(team, ctx, _semantic=None):
+    return extern_call(
+        "librocshmem_device",
+        "",
+        [
+            tl.cast(team, pi_u64_t, _semantic=_semantic),
+            tl.cast(ctx, pi_u64_t, _semantic=_semantic),
+        ],
+        {
+            (pi_u64_t, pi_u64_t): {
+                "rocshmem_wg_team_create_ctx_wrapper",
+                ()
+            }
+        },
+        is_pure=False, _semantic=_semantic
     )
