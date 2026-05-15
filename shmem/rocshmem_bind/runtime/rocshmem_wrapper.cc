@@ -195,7 +195,7 @@ rocshmem_barrier_all_wave_wrapper() {
 }
 
 __device__ void __attribute__((visibility("default")))
-rocshmem_fence_wave_wrapper() {
+rocshmem_fence_wrapper() {
   rocshmem_fence();
 }
 }
