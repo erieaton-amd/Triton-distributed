@@ -246,11 +246,8 @@ def allreduce_two_shot_push_intra_node_kernel(
 
     if pid == 0:
         offs = tl.arange(0, world_size * 2)
-        tl.store(symm_signal_ptr + offs, tl.zeros([world_size * 2], dtype=tl.int64))
-        if thread_idx == 0:
-            libshmem_device.barrier_all()
-    __syncthreads()
-
+        tl.store(symm_signal_ptr + offs, 0)
+        libshmem_device.barrier_all_wg()
     barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
 
     if pid < world_size:
@@ -264,7 +261,6 @@ def allreduce_two_shot_push_intra_node_kernel(
             libshmem_device.ROCSHMEM_SIGNAL_SET,
             peer,
         )
-    libshmem_device.fence()
 
     if thread_idx < world_size:
         libshmem_device.signal_wait_until(
