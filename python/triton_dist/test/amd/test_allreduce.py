@@ -26,6 +26,9 @@
 
 Analogous to ``test/nvidia/test_allreduce.py``, restricted to ``one_shot`` and
 ``two_shot`` (see ``kernels/amd/allreduce.py``).
+
+Perf mode benchmarks Triton all-reduce against RCCL (``torch.distributed.all_reduce``
+uses RCCL on ROCm; see project notes).
 """
 import argparse
 import itertools
@@ -79,6 +82,18 @@ def _pretty_format(nbytes):
     if nbytes < 1024 * 1024 * 1024:
         return f"{nbytes / 1024 / 1024}MB"
     return f"{nbytes / 1024 / 1024 / 1024}GB"
+
+
+def _algo_hw_bw_gbps(nbytes: int, duration_ms: float, world_size: int, is_one_shot: bool):
+    """Algorithm and hardware bandwidth (GB/s), matching ``run_perf`` conventions."""
+    algo_bw = nbytes * 1e-9 / (duration_ms * 1e-3) * 2
+    if world_size <= 1:
+        hw_bw = algo_bw
+    elif is_one_shot:
+        hw_bw = algo_bw * world_size // 2
+    else:
+        hw_bw = algo_bw * (world_size - 1) / world_size
+    return algo_bw, hw_bw
 
 
 def _create_data(numel, dtype=torch.float32):
@@ -165,31 +180,71 @@ def run_perf(dtype: torch.dtype, method: AllReduceMethod, warmup=5, iters=10):
     bytes_per_elem = dtype.itemsize
     available_ds = DATA_SIZES
     ctx = create_allreduce_ctx(available_ds[-1], RANK, WORLD_SIZE, LOCAL_WORLD_SIZE)
+    is_one_shot = _is_one_shot(method)
+    ratio_samples = []
+
+    if RANK == 0:
+        print(
+            "Bandwidth vs RCCL: RCCL is measured with torch.distributed.all_reduce "
+            "(RCCL on ROCm). Same warmup/iters and per-size message volume as Triton."
+        )
+        print(
+            f"{'size':>8}  {'Triton algo':>12}  {'RCCL algo':>12}  {'Triton/RCCL':>12}  "
+            f"{'Triton HW':>12}  {'RCCL HW':>12}  {'latency Triton':>14}  {'latency RCCL':>14}"
+        )
+        print(
+            f"{'':>8}  {'GB/s':>12}  {'GB/s':>12}  {'(algo)':>12}  "
+            f"{'GB/s':>12}  {'GB/s':>12}  {'us':>14}  {'us':>14}"
+        )
 
     for nbytes in available_ds:
         num_elem = nbytes // bytes_per_elem
         if method == AllReduceMethod.TwoShot and num_elem % WORLD_SIZE != 0:
             continue
         local_input = _create_data(num_elem, dtype=dtype)
+        rccl_buf = local_input.clone()
 
         def allreduce_op():
             all_reduce(local_input, method=method, ctx=ctx)
 
         sleep_async(100)
-        _, duration_ms = perf_func(allreduce_op, warmup_iters=warmup, iters=iters)
+        _, triton_ms = perf_func(allreduce_op, warmup_iters=warmup, iters=iters)
+        triton_algo, triton_hw = _algo_hw_bw_gbps(nbytes, triton_ms, WORLD_SIZE, is_one_shot)
 
-        algo_bw = nbytes * 1e-9 / (duration_ms * 1e-3) * 2
-        hw_bw = algo_bw * (WORLD_SIZE - 1) / WORLD_SIZE
-        if _is_one_shot(method):
-            hw_bw = algo_bw * WORLD_SIZE // 2
+        def rccl_allreduce_op():
+            dist.all_reduce(rccl_buf, group=TP_GROUP)
+
+        sleep_async(100)
+        _, rccl_ms = perf_func(rccl_allreduce_op, warmup_iters=warmup, iters=iters)
+        rccl_algo, rccl_hw = _algo_hw_bw_gbps(nbytes, rccl_ms, WORLD_SIZE, is_one_shot=False)
+
+        if rccl_algo > 0:
+            ratio_samples.append(triton_algo / rccl_algo)
 
         if RANK == 0:
+            ratio_str = f"{triton_algo / rccl_algo:0.3f}" if rccl_algo > 0 else "n/a"
             print(
-                f"RANK = {RANK}, " + _pretty_format(nbytes) +
-                f" Latency = {duration_ms * 1000:0.2f} us, HW Bandwith = {hw_bw:0.2f} GB/s, Algo Bandwith = {algo_bw:0.2f} GB/s   "
+                f"{_pretty_format(nbytes):>8}  {triton_algo:12.2f}  {rccl_algo:12.2f}  {ratio_str:>12}  "
+                f"{triton_hw:12.2f}  {rccl_hw:12.2f}  {triton_ms * 1000:14.2f}  {rccl_ms * 1000:14.2f}"
             )
 
     ctx.finalize()
+
+    if RANK == 0 and ratio_samples:
+        mean_ratio = sum(ratio_samples) / len(ratio_samples)
+        if mean_ratio > 1.0:
+            print(
+                f"\nSummary: mean algorithm-bandwidth ratio Triton/RCCL = {mean_ratio:.3f} "
+                f"over {len(ratio_samples)} sizes (Triton higher by ~{mean_ratio:.2f}x on average)."
+            )
+        elif mean_ratio < 1.0:
+            inv = 1.0 / mean_ratio
+            print(
+                f"\nSummary: mean algorithm-bandwidth ratio Triton/RCCL = {mean_ratio:.3f} "
+                f"over {len(ratio_samples)} sizes (RCCL higher by ~{inv:.2f}x on average)."
+            )
+        else:
+            print(f"\nSummary: mean Triton/RCCL algorithm bandwidth ≈ 1.0 over {len(ratio_samples)} sizes.")
 
 
 def _triton_warmup():
@@ -200,8 +255,8 @@ def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max_nbytes", type=int, default=1024 * 4096)
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--warmup_iters", type=int, default=5)
-    parser.add_argument("--verify_shapes", type=int, default=25)
+    parser.add_argument("--warmup_iters", type=int, default=25)
+    parser.add_argument("--verify_shapes", type=int, default=200)
     parser.add_argument("--verify_hang", type=int, default=100)
     parser.add_argument("--seed", type=int, default=40)
     parser.add_argument("--alignment", type=int, default=16)
