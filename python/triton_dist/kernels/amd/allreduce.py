@@ -38,11 +38,15 @@ import torch
 import triton
 import triton.language as tl
 import triton_dist
+import triton_dist.language as dl
+import torch.distributed
 from triton_dist.language.extra.hip.librocshmem_device import set_rocshmem_ctx
 from triton_dist.kernels.allreduce import AllReduceMethod
 from triton_dist.kernels.amd.common_ops import barrier_on_this_grid
 from triton_dist.language.extra import libshmem_device
 from triton_dist.language.extra.language_extra import __syncthreads, tid
+
+from triton_dist.test.utils import assert_allclose
 from triton_dist.utils import (
     NVSHMEM_SIGNAL_DTYPE,
     get_device_property,
@@ -252,7 +256,7 @@ def allreduce_two_shot_push_intra_node_kernel(
 
     if pid < world_size:
         peer = (rank + pid + 1) % world_size
-        libshmem_device.putmem_signal_nbi_wave(
+        libshmem_device.putmem_signal_nbi_wg(
             symm_recv_ptr + rank * elem_per_rank,
             input_ptr + peer * elem_per_rank,
             nbytes_shard,
@@ -284,7 +288,7 @@ def allreduce_two_shot_push_intra_node_kernel(
     symm_signal_ptr += world_size
     if pid < world_size - 1:
         peer = (rank + pid + 1) % world_size
-        libshmem_device.putmem_signal_nbi_wave(
+        libshmem_device.putmem_signal_nbi_wg(
             symm_out_ptr + rank * elem_per_rank,
             symm_out_ptr + rank * elem_per_rank,
             nbytes_shard,
@@ -306,6 +310,102 @@ def allreduce_two_shot_push_intra_node_kernel(
 
     copy_continuous_kernel(symm_out_ptr, out_ptr, n_elements, BLOCK_SIZE)
 
+@triton_dist.jit(do_not_specialize=["rank"])
+def allreduce_two_shot_push_intra_node_kernel_v2(
+    ctx,
+    input_ptr,
+    symm_out_ptr,
+    symm_signal_ptr,
+    grid_barrier_ptr,
+    out_ptr,
+    rank,
+    world_size: tl.constexpr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    use_cooperative: tl.constexpr,
+):
+    set_rocshmem_ctx(ctx)
+    thread_idx = tid(0)
+    pid = tl.program_id(0)
+    num_sms = tl.num_programs(0)
+    elem_size = tl.constexpr(input_ptr.dtype.element_ty.primitive_bitwidth) // 8
+    elem_per_rank = tl.cdiv(n_elements, world_size)
+    symm_out_ptr = tl.cast(symm_out_ptr, input_ptr.dtype)
+    symm_recv_ptr = symm_out_ptr + n_elements
+    nbytes_shard = tl.cast(elem_per_rank * elem_size, tl.uint64)
+    sig_one = tl.cast(1, tl.uint64)
+    
+    num_blocks = tl.cdiv(elem_per_rank, BLOCK_SIZE)
+    total_blocks = num_blocks * world_size
+
+    if pid == 0:
+        offs = tl.arange(0, world_size * 1024)
+        tl.store(symm_signal_ptr + offs, 0)
+        libshmem_device.barrier_all_wg()
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
+
+    for job in range(pid, total_blocks, num_sms):
+        peer = job % world_size
+        block = job // world_size
+
+        src_ptr = input_ptr + peer * elem_per_rank;
+        peer_ptr = dl.symm_at(symm_recv_ptr + rank * elem_per_rank, peer)
+            
+        offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < elem_per_rank
+        src_ptrs = src_ptr + offsets
+        peer_ptrs = peer_ptr + offsets
+        tl.store(peer_ptrs, tl.load(src_ptrs, mask=mask), mask=mask)
+        if thread_idx == 0:
+            peer_signal = dl.symm_at(symm_signal_ptr + block * world_size + rank, peer)
+            tl.atomic_add(peer_signal, 1, sem="release", scope="sys")
+
+    if thread_idx < world_size:
+        for block in range(num_blocks):
+            offset = block * world_size + thread_idx
+            libshmem_device.signal_wait_until(
+                symm_signal_ptr + offset,
+                libshmem_device.ROCSHMEM_CMP_EQ,
+                sig_one,
+            )
+    
+    __syncthreads()
+    libshmem_device.fence()
+
+    kernel_ring_reduce_non_tma(
+        symm_recv_ptr,
+        symm_out_ptr + elem_per_rank * rank,
+        elem_per_rank,
+        rank,
+        world_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
+
+    symm_signal_ptr += total_blocks
+    if pid < world_size - 1:
+        peer = (rank + pid + 1) % world_size
+        libshmem_device.putmem_signal_nbi_wg(
+            symm_out_ptr + rank * elem_per_rank,
+            symm_out_ptr + rank * elem_per_rank,
+            nbytes_shard,
+            symm_signal_ptr + rank,
+            sig_one,
+            libshmem_device.ROCSHMEM_SIGNAL_SET,
+            peer,
+        )
+    libshmem_device.fence()
+
+    if thread_idx < world_size and thread_idx != rank:
+        libshmem_device.signal_wait_until(
+            symm_signal_ptr + thread_idx,
+            libshmem_device.ROCSHMEM_CMP_EQ,
+            sig_one,
+        )
+    __syncthreads()
+    libshmem_device.fence()
+
+    copy_continuous_kernel(symm_out_ptr, out_ptr, n_elements, BLOCK_SIZE)
 
 def allreduce_one_shot_push_intra_node(
     ctx: AllReduceContext,
@@ -374,6 +474,7 @@ def allreduce_two_shot_push_intra_node(
         num_tiles = min(max_sm, num_tiles)
     num_tiles = max(ctx.world_size, min(get_device_property().multi_processor_count, num_tiles))
     dev_ctx = pyrocshmem.rocshmem_get_device_ctx()
+
     allreduce_two_shot_push_intra_node_kernel[(num_tiles, )](
         dev_ctx,
         x,
@@ -389,6 +490,7 @@ def allreduce_two_shot_push_intra_node(
         use_cooperative=False,
         **launch_cooperative_grid_options(),
     )
+
     return output
 
 
