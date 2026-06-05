@@ -45,6 +45,7 @@ from triton_dist.kernels.allreduce import AllReduceMethod
 from triton_dist.kernels.amd.common_ops import barrier_on_this_grid
 from triton_dist.language.extra import libshmem_device
 from triton_dist.language.extra.language_extra import __syncthreads, tid
+from hip import hip
 
 from triton_dist.test.utils import assert_allclose
 from triton_dist.utils import (
@@ -407,6 +408,153 @@ def allreduce_two_shot_push_intra_node_kernel_v2(
 
     copy_continuous_kernel(symm_out_ptr, out_ptr, n_elements, BLOCK_SIZE)
 
+
+@triton_dist.jit(do_not_specialize=["group_rank"])
+def persistent_all_reduce_two_shot(
+    ctx,
+    input_ptr,
+    output_ptr,
+    M,
+    N,
+    stride_in_m,
+    stride_in_n,
+    stride_out_m,
+    stride_out_n,
+    group_rank: tl.constexpr,
+    iris_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    rank_start: tl.constexpr,
+    rank_stride: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    DISTRIBUTION: tl.constexpr,
+):
+    """Reduce assigned tiles for a rank and broadcast the result to all peers.
+    Single kernel: unmasked fast path for full tiles, masked slow path for tails.
+    """
+    set_rocshmem_ctx(ctx)
+    pid = tl.program_id(0)
+    COMM_SMS = tl.num_programs(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    total_tiles = num_pid_m * num_pid_n
+
+    acc_dtype = tl.float32 if output_ptr.type.element_ty != tl.int8 else tl.int32
+
+    tiles_per_rank = tl.cdiv(total_tiles, world_size)
+    if DISTRIBUTION == 0:
+        start_tile = group_rank
+        stride = world_size
+        remaining = total_tiles - start_tile
+        remaining = tl.maximum(remaining, 0)
+        max_tile_offset = tl.cdiv(remaining, stride)
+    else:
+        start_tile = group_rank * tiles_per_rank
+        stride = 1
+        remaining = total_tiles - start_tile
+        remaining = tl.maximum(remaining, 0)
+        max_tile_offset = tl.minimum(tiles_per_rank, remaining)
+
+    # Persistent traversal
+    for tile_offset in range(pid, max_tile_offset, COMM_SMS):
+        tile_id = start_tile + tile_offset * stride
+
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+        rm_base = pid_m * BLOCK_SIZE_M
+        rn_base = pid_n * BLOCK_SIZE_N
+
+        is_full = (rm_base + BLOCK_SIZE_M <= M) & (rn_base + BLOCK_SIZE_N <= N)
+
+        # Build indices (used by both paths)
+        rm = rm_base + tl.arange(0, BLOCK_SIZE_M)
+        rn = rn_base + tl.arange(0, BLOCK_SIZE_N)
+
+        rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        input_offset = rm[:, None] * stride_in_m + rn[None, :] * stride_in_n
+        output_offset = rm[:, None] * stride_out_m + rn[None, :] * stride_out_n
+
+        #base_ptr = input_ptr + input_offset
+        out_ptr = output_ptr + output_offset
+
+        # Fast path: NO MASKS (full tiles)
+        # The masking is problem size dependent, and the compiler does not recognize it can have two paths
+        # (one with masks and one without). Separate unmasked paths allow the compiler to generate
+        # more efficient vectorized instructions.
+        if is_full:
+            mask = (rm[:, None] < M) & (rn[None, :] < N)
+
+            start_rank_idx = pid % world_size
+            start_rank_global = rank_start + start_rank_idx * rank_stride
+            base_rank_ptr = dl.symm_at(input_ptr, start_rank_global) + input_offset
+            acc = tl.load(base_rank_ptr).to(acc_dtype)
+            #acc = iris.load(base_ptr, iris_rank, start_rank_global, heap_bases).to(acc_dtype)
+            for i in tl.static_range(1, world_size):
+                remote_rank_idx = (start_rank_idx + i) % world_size
+                remote_rank = rank_start + remote_rank_idx * rank_stride
+                base_rank_ptr = dl.symm_at(input_ptr, remote_rank) + input_offset
+                acc += tl.load(base_rank_ptr).to(acc_dtype)
+                # acc += iris.load(base_ptr, iris_rank, remote_rank, heap_bases).to(acc_dtype)
+
+            reduced = acc.to(output_ptr.type.element_ty)
+
+            tl.store(out_ptr, reduced, cache_modifier=".wt")
+
+            for i in tl.static_range(0, world_size):
+                remote_rank_idx = (start_rank_idx + i) % world_size
+                remote_rank = rank_start + remote_rank_idx * rank_stride
+                if remote_rank_idx != group_rank:
+                    out_rank_ptr = dl.symm_at(output_ptr, remote_rank) + output_offset
+                    tl.store(out_rank_ptr, reduced)
+                    # iris.store(out_ptr, reduced, iris_rank, remote_rank, heap_bases, hint=(1, BLOCK_SIZE_N))
+
+        # Slow path: MASKED (only boundary tiles land here)
+        # This path handles tiles at tensor boundaries where not all elements are valid.
+        else:
+            mask = (rm[:, None] < M) & (rn[None, :] < N)
+
+            start_rank_idx = pid % world_size
+            start_rank_global = rank_start + start_rank_idx * rank_stride
+            base_rank_ptr = dl.symm_at(input_ptr, start_rank_global) + input_offset
+            acc = tl.load(base_rank_ptr, mask=mask)
+            #acc = iris.load(base_ptr, iris_rank, start_rank_global, heap_bases, mask=mask).to(acc_dtype)
+            for i in tl.static_range(1, world_size):
+                remote_rank_idx = (start_rank_idx + i) % world_size
+                remote_rank = rank_start + remote_rank_idx * rank_stride
+                base_rank_ptr = dl.symm_at(input_ptr, remote_rank) + input_offset
+                acc += tl.load(base_rank_ptr, mask=mask).to(acc_dtype)
+                #acc += iris.load(base_ptr, iris_rank, remote_rank, heap_bases, mask=mask).to(acc_dtype)
+
+            reduced = acc.to(output_ptr.type.element_ty)
+
+            tl.store(out_ptr, reduced, mask=mask, cache_modifier=".wt")
+
+            for i in tl.static_range(0, world_size):
+                remote_rank_idx = (start_rank_idx + i) % world_size
+                remote_rank = rank_start + remote_rank_idx * rank_stride
+                if remote_rank_idx != group_rank:
+                    out_rank_ptr = dl.symm_at(output_ptr, remote_rank) + output_offset
+                    tl.store(out_rank_ptr, reduced, mask=mask)
+                    # iris.store(
+                    #     out_ptr,
+                    #     reduced,
+                    #     iris_rank,
+                    #     remote_rank,
+                    #     heap_bases,
+                    #     mask=mask,
+                    #     hint=(1, BLOCK_SIZE_N),
+                    # )
+
+
 def allreduce_one_shot_push_intra_node(
     ctx: AllReduceContext,
     x: torch.Tensor,
@@ -475,20 +623,66 @@ def allreduce_two_shot_push_intra_node(
     num_tiles = max(ctx.world_size, min(get_device_property().multi_processor_count, num_tiles))
     dev_ctx = pyrocshmem.rocshmem_get_device_ctx()
 
-    allreduce_two_shot_push_intra_node_kernel[(num_tiles, )](
+    print("input")
+
+    # allreduce_two_shot_push_intra_node_kernel[(num_tiles, )](
+    #     dev_ctx,
+    #     x,
+    #     ctx.symm_scatter_buf,
+    #     ctx.symm_signal,
+    #     ctx.grid_barrier,
+    #     output,
+    #     ctx.rank,
+    #     ctx.world_size,
+    #     num_elem,
+    #     BLOCK_SIZE=block_size,
+    #     num_warps=num_warps,
+    #     use_cooperative=False,
+    #     **launch_cooperative_grid_options(),
+    # )
+
+    # Copy from non-symmetric memory to symmetric memory. The iris-based kernels don't do this for you.
+    hip.hipMemcpy(
+        ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2],
+        x.data_ptr(),
+        x.nbytes,
+        hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
+    )
+
+    print("kernel")
+    reshape_2d = (num_elem // ctx.world_size, ctx.world_size)
+    input_buf = ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2].view(dtype=x.dtype).view(reshape_2d)
+    output_buf = ctx.symm_scatter_buf[:x.nbytes].view(dtype=x.dtype).view(reshape_2d)
+    persistent_all_reduce_two_shot[(num_tiles, )](
         dev_ctx,
-        x,
-        ctx.symm_scatter_buf,
-        ctx.symm_signal,
-        ctx.grid_barrier,
-        output,
+        input_buf,
+        output_buf,
+        input_buf.shape[0],
+        input_buf.shape[1],
+        input_buf.stride(0),
+        input_buf.stride(1),
+        output_buf.stride(0),
+        output_buf.stride(1),
+        ctx.rank,
         ctx.rank,
         ctx.world_size,
-        num_elem,
-        BLOCK_SIZE=block_size,
-        num_warps=num_warps,
-        use_cooperative=False,
-        **launch_cooperative_grid_options(),
+        0,
+        1,
+        block_size // ctx.world_size,
+        ctx.world_size,
+        4,
+        0
+    )
+    pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+
+    print("output")
+
+    hip.hipMemcpy(
+        output.data_ptr(), 
+        ctx.symm_scatter_buf[:x.nbytes],
+        x.nbytes,
+        hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
     )
 
     return output
