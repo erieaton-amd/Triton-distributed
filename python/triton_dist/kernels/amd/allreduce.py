@@ -39,7 +39,6 @@ import triton
 import triton.language as tl
 import triton_dist
 import triton_dist.language as dl
-import torch.distributed
 from triton_dist.language.extra.hip.librocshmem_device import set_rocshmem_ctx
 from triton_dist.kernels.allreduce import AllReduceMethod
 from triton_dist.kernels.amd.common_ops import barrier_on_this_grid
@@ -411,7 +410,6 @@ def allreduce_two_shot_push_intra_node_kernel_v2(
 
 @triton_dist.jit(do_not_specialize=["group_rank"])
 def persistent_all_reduce_two_shot(
-    ctx,
     input_ptr,
     output_ptr,
     M,
@@ -433,7 +431,6 @@ def persistent_all_reduce_two_shot(
     """Reduce assigned tiles for a rank and broadcast the result to all peers.
     Single kernel: unmasked fast path for full tiles, masked slow path for tails.
     """
-    set_rocshmem_ctx(ctx)
     pid = tl.program_id(0)
     COMM_SMS = tl.num_programs(0)
 
@@ -497,13 +494,11 @@ def persistent_all_reduce_two_shot(
             start_rank_global = rank_start + start_rank_idx * rank_stride
             base_rank_ptr = dl.symm_at(input_ptr, start_rank_global) + input_offset
             acc = tl.load(base_rank_ptr).to(acc_dtype)
-            #acc = iris.load(base_ptr, iris_rank, start_rank_global, heap_bases).to(acc_dtype)
             for i in tl.static_range(1, world_size):
                 remote_rank_idx = (start_rank_idx + i) % world_size
                 remote_rank = rank_start + remote_rank_idx * rank_stride
                 base_rank_ptr = dl.symm_at(input_ptr, remote_rank) + input_offset
                 acc += tl.load(base_rank_ptr).to(acc_dtype)
-                # acc += iris.load(base_ptr, iris_rank, remote_rank, heap_bases).to(acc_dtype)
 
             reduced = acc.to(output_ptr.type.element_ty)
 
@@ -515,7 +510,6 @@ def persistent_all_reduce_two_shot(
                 if remote_rank_idx != group_rank:
                     out_rank_ptr = dl.symm_at(output_ptr, remote_rank) + output_offset
                     tl.store(out_rank_ptr, reduced)
-                    # iris.store(out_ptr, reduced, iris_rank, remote_rank, heap_bases, hint=(1, BLOCK_SIZE_N))
 
         # Slow path: MASKED (only boundary tiles land here)
         # This path handles tiles at tensor boundaries where not all elements are valid.
@@ -526,13 +520,11 @@ def persistent_all_reduce_two_shot(
             start_rank_global = rank_start + start_rank_idx * rank_stride
             base_rank_ptr = dl.symm_at(input_ptr, start_rank_global) + input_offset
             acc = tl.load(base_rank_ptr, mask=mask)
-            #acc = iris.load(base_ptr, iris_rank, start_rank_global, heap_bases, mask=mask).to(acc_dtype)
             for i in tl.static_range(1, world_size):
                 remote_rank_idx = (start_rank_idx + i) % world_size
                 remote_rank = rank_start + remote_rank_idx * rank_stride
                 base_rank_ptr = dl.symm_at(input_ptr, remote_rank) + input_offset
                 acc += tl.load(base_rank_ptr, mask=mask).to(acc_dtype)
-                #acc += iris.load(base_ptr, iris_rank, remote_rank, heap_bases, mask=mask).to(acc_dtype)
 
             reduced = acc.to(output_ptr.type.element_ty)
 
@@ -544,15 +536,6 @@ def persistent_all_reduce_two_shot(
                 if remote_rank_idx != group_rank:
                     out_rank_ptr = dl.symm_at(output_ptr, remote_rank) + output_offset
                     tl.store(out_rank_ptr, reduced, mask=mask)
-                    # iris.store(
-                    #     out_ptr,
-                    #     reduced,
-                    #     iris_rank,
-                    #     remote_rank,
-                    #     heap_bases,
-                    #     mask=mask,
-                    #     hint=(1, BLOCK_SIZE_N),
-                    # )
 
 
 def allreduce_one_shot_push_intra_node(
@@ -623,8 +606,6 @@ def allreduce_two_shot_push_intra_node(
     num_tiles = max(ctx.world_size, min(get_device_property().multi_processor_count, num_tiles))
     dev_ctx = pyrocshmem.rocshmem_get_device_ctx()
 
-    print("input")
-
     # allreduce_two_shot_push_intra_node_kernel[(num_tiles, )](
     #     dev_ctx,
     #     x,
@@ -648,13 +629,16 @@ def allreduce_two_shot_push_intra_node(
         x.nbytes,
         hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
     )
+    pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
 
-    print("kernel")
-    reshape_2d = (num_elem // ctx.world_size, ctx.world_size)
+    extra_dim = 16
+    if num_elem % extra_dim != 0:
+        raise RuntimeError("Bad dimension")
+    reshape_2d = (num_elem // extra_dim, extra_dim)
     input_buf = ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2].view(dtype=x.dtype).view(reshape_2d)
     output_buf = ctx.symm_scatter_buf[:x.nbytes].view(dtype=x.dtype).view(reshape_2d)
     persistent_all_reduce_two_shot[(num_tiles, )](
-        dev_ctx,
         input_buf,
         output_buf,
         input_buf.shape[0],
@@ -668,15 +652,13 @@ def allreduce_two_shot_push_intra_node(
         ctx.world_size,
         0,
         1,
-        block_size // ctx.world_size,
-        ctx.world_size,
+        block_size // extra_dim,
+        extra_dim,
         4,
         0
     )
     pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
-
-    print("output")
 
     hip.hipMemcpy(
         output.data_ptr(), 

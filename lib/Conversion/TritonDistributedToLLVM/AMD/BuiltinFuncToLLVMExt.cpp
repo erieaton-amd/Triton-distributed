@@ -283,7 +283,13 @@ struct ConvertBuiltinFuncToLLVMExt
     ModuleOp mod = getOperation();
 
     GreedyRewriteConfig config;
-    config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Aggressive);
+    // Use Normal (not Aggressive) region simplification: Aggressive enables
+    // mergeIdenticalBlocks(), which blows up super-linearly on the thousands of
+    // near-identical control-flow diamonds produced when masked predicated
+    // load/store calls are lowered (see ConvertBuiltinFuncToLLVM). This pass
+    // runs right after that one, over the same exploded CFG, so it must avoid
+    // block merging too or it hangs identically.
+    config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
 
     RewritePatternSet patterns(context);
     patterns.add<CallOpConversion>(context, this->ftz);
