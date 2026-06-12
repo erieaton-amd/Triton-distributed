@@ -538,6 +538,96 @@ def persistent_all_reduce_two_shot(
                     tl.store(out_rank_ptr, reduced, mask=mask)
 
 
+@triton_dist.jit
+def allreduce_twoshot_fused_kernel(
+    x_ptr,
+    y_ptr,
+    M,
+    N,
+    stride_m,
+    my_pe,
+    ws: tl.constexpr,
+    COMM_SMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Fused tile-owned two-shot all-reduce in a single persistent kernel.
+
+    Collapses ``reduce_scatter_kernel -> barrier -> all_gather_push_kernel``
+    into one pass with **no intermediate shard** and **no mid-phase barrier**.
+
+    Partitioning is by *tile ownership*: rank ``my_pe`` owns tiles
+    ``{my_pe, my_pe+ws, my_pe+2*ws, ...}``.  For each owned tile this rank
+
+      1. **reduces** the tile across every peer's symmetric input ``x`` straight
+         into registers (the reduce-scatter, but with no materialized shard),
+      2. **scatters** the reduced tile into every peer's symmetric output ``y``
+         (the all-gather, push-style).
+
+    Because each output tile is produced by exactly one owner and inputs are
+    read-only, there is no cross-phase dependency to barrier on; the only sync
+    needed is a single *trailing* ``barrier_all`` (issued by the driver) so
+    peers' remote writes are visible before the result is consumed.  Works for
+    any ``(M, N)`` — ownership is per-tile, so ``M`` need not divide ``ws``.
+
+    Args:
+        x_ptr: symmetric ``(M, N)`` input (read from all peers).
+        y_ptr: symmetric ``(M, N)`` output (peers push reduced tiles into it).
+        heap_bases: ``(n_pes,)`` int64 per-PE heap bases.
+        M, N: tensor shape; stride_m: row stride of ``x`` and ``y``.
+        my_pe, ws: this PE's index and the world size.
+        COMM_SMS: persistent-grid width (caller clamps to CUs / total tiles).
+        BLOCK_M, BLOCK_N: per-program tile size.
+        GROUP_SIZE_M: tile-swizzle group size for receiver-side L2 locality.
+    """
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    total_tiles = num_pid_m * num_pid_n
+
+    # Tiles this rank owns: my_pe, my_pe+ws, ...  The COMM_SMS persistent
+    # programs split the owned tiles among themselves (grid-stride).
+    remaining = tl.maximum(total_tiles - my_pe, 0)
+    n_owned = tl.cdiv(remaining, ws)
+
+    for k in range(pid, n_owned, COMM_SMS):
+        tile_id = my_pe + k * ws
+
+        # GROUP_SIZE_M swizzle -> (pid_m, pid_n) for receiver-side L2 locality
+        # (same swizzle the push all-gather uses).
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        offsets = offs_m[:, None] * stride_m + offs_n[None, :]
+
+        # Reduce: sum this tile across every peer's input, in fp32 registers.
+        # Rotating the start peer by my_pe staggers receive-side read traffic.
+        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        for i in tl.static_range(0, ws):
+            peer = (my_pe + 1 + i) % ws
+            peer_x = dl.symm_at(x_ptr, peer)
+            acc += tl.load(peer_x + offsets, mask=mask, other=0.0).to(tl.float32)
+        reduced = acc.to(y_ptr.dtype.element_ty)
+
+        # Scatter: write the reduced tile locally (write-through) and push it
+        # into every peer's output.
+        tl.store(y_ptr + offsets, reduced, mask=mask, cache_modifier=".wt")
+        for i in tl.static_range(0, ws):
+            peer = (my_pe + 1 + i) % ws
+            if peer != my_pe:
+                peer_y = dl.symm_at(y_ptr, peer)
+                tl.store(peer_y + offsets, reduced, mask=mask)
+
+
 def allreduce_one_shot_push_intra_node(
     ctx: AllReduceContext,
     x: torch.Tensor,
@@ -632,30 +722,42 @@ def allreduce_two_shot_push_intra_node(
     pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
 
-    extra_dim = 16
-    if num_elem % extra_dim != 0:
-        raise RuntimeError("Bad dimension")
+    extra_dim = 8
+    assert num_elem % extra_dim == 0, "Bad dimension"
     reshape_2d = (num_elem // extra_dim, extra_dim)
     input_buf = ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2].view(dtype=x.dtype).view(reshape_2d)
     output_buf = ctx.symm_scatter_buf[:x.nbytes].view(dtype=x.dtype).view(reshape_2d)
-    persistent_all_reduce_two_shot[(num_tiles, )](
+    # persistent_all_reduce_two_shot[(num_tiles, )](
+    #     input_buf,
+    #     output_buf,
+    #     input_buf.shape[0],
+    #     input_buf.shape[1],
+    #     input_buf.stride(0),
+    #     input_buf.stride(1),
+    #     output_buf.stride(0),
+    #     output_buf.stride(1),
+    #     ctx.rank,
+    #     ctx.rank,
+    #     ctx.world_size,
+    #     0,
+    #     1,
+    #     block_size // extra_dim,
+    #     extra_dim,
+    #     4,
+    #     0
+    # )
+    allreduce_twoshot_fused_kernel[(num_tiles, )](
         input_buf,
         output_buf,
         input_buf.shape[0],
         input_buf.shape[1],
         input_buf.stride(0),
-        input_buf.stride(1),
-        output_buf.stride(0),
-        output_buf.stride(1),
-        ctx.rank,
         ctx.rank,
         ctx.world_size,
-        0,
-        1,
+        num_tiles,
         block_size // extra_dim,
         extra_dim,
         4,
-        0
     )
     pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
