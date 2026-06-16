@@ -87,6 +87,8 @@ class AllReduceContext:
     local_rank: int = dataclasses.field(init=False)
     node_id: int = dataclasses.field(init=False)
     nnodes: int = dataclasses.field(init=False)
+    num_xcds: int | None = None
+    swizzle_size: int = 4
 
     def __post_init__(self):
         self.local_rank = self.rank % self.local_world_size
@@ -103,10 +105,17 @@ class AllReduceContext:
 
 def create_allreduce_ctx(workspace_nbytes, rank, world_size, local_world_size) -> AllReduceContext:
     symm_scatter_buf = pyrocshmem.rocshmem_create_tensor((workspace_nbytes, ), torch.int8)
+    #symm_scatter_buf = pyrocshmem.rocshmem_create_tensor((1, ), torch.int8)
     symm_signal = pyrocshmem.rocshmem_create_tensor((MAX_DOUBLE_TREE_BLOCKS * world_size, ), NVSHMEM_SIGNAL_DTYPE)
     symm_signal.fill_(0)
     rocshmem_barrier_all_on_stream(torch.cuda.current_stream())
     torch.cuda.synchronize()
+    err, num_xcds = hip.hipDeviceGetAttribute(
+        hip.hipDeviceAttribute_t.hipDeviceAttributeNumberOfXccs,
+        torch.cuda.current_device()
+    )
+    if isinstance(err, hip.hipError_t) and err != hip.hipError_t.hipSuccess:
+        raise RuntimeError(str(err))
     return AllReduceContext(
         workspace_nbytes=workspace_nbytes,
         rank=rank,
@@ -114,6 +123,7 @@ def create_allreduce_ctx(workspace_nbytes, rank, world_size, local_world_size) -
         local_world_size=local_world_size,
         symm_scatter_buf=symm_scatter_buf,
         symm_signal=symm_signal,
+        num_xcds=num_xcds,
     )
 
 
@@ -537,95 +547,159 @@ def persistent_all_reduce_two_shot(
                     out_rank_ptr = dl.symm_at(output_ptr, remote_rank) + output_offset
                     tl.store(out_rank_ptr, reduced, mask=mask)
 
+@triton_dist.jit()
+def chiplet_transform_chunked(pid, num_workgroups: tl.constexpr, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
+    """
+    Transform program ID for chiplet-aware workgroup distribution.
 
-@triton_dist.jit
-def allreduce_twoshot_fused_kernel(
-    x_ptr,
-    y_ptr,
-    M,
-    N,
-    stride_m,
-    my_pe,
-    ws: tl.constexpr,
-    COMM_SMS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    """Fused tile-owned two-shot all-reduce in a single persistent kernel.
-
-    Collapses ``reduce_scatter_kernel -> barrier -> all_gather_push_kernel``
-    into one pass with **no intermediate shard** and **no mid-phase barrier**.
-
-    Partitioning is by *tile ownership*: rank ``my_pe`` owns tiles
-    ``{my_pe, my_pe+ws, my_pe+2*ws, ...}``.  For each owned tile this rank
-
-      1. **reduces** the tile across every peer's symmetric input ``x`` straight
-         into registers (the reduce-scatter, but with no materialized shard),
-      2. **scatters** the reduced tile into every peer's symmetric output ``y``
-         (the all-gather, push-style).
-
-    Because each output tile is produced by exactly one owner and inputs are
-    read-only, there is no cross-phase dependency to barrier on; the only sync
-    needed is a single *trailing* ``barrier_all`` (issued by the driver) so
-    peers' remote writes are visible before the result is consumed.  Works for
-    any ``(M, N)`` — ownership is per-tile, so ``M`` need not divide ``ws``.
+    This function redistributes workgroups across multiple XCDs (chiplets) in chunks
+    to improve load balancing and memory access patterns.
 
     Args:
-        x_ptr: symmetric ``(M, N)`` input (read from all peers).
-        y_ptr: symmetric ``(M, N)`` output (peers push reduced tiles into it).
-        heap_bases: ``(n_pes,)`` int64 per-PE heap bases.
-        M, N: tensor shape; stride_m: row stride of ``x`` and ``y``.
-        my_pe, ws: this PE's index and the world size.
-        COMM_SMS: persistent-grid width (caller clamps to CUs / total tiles).
-        BLOCK_M, BLOCK_N: per-program tile size.
-        GROUP_SIZE_M: tile-swizzle group size for receiver-side L2 locality.
-    """
-    pid = tl.program_id(0)
+        pid: Program ID to transform
+        num_workgroups: Total number of workgroups
+        num_xcds: Number of XCDs (chiplets)
+        chunk_size: Size of chunks for distribution
 
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    Returns:
+        Transformed program ID
+    """
+    if pid > (num_workgroups // (num_xcds * chunk_size)) * (num_xcds * chunk_size):
+        return pid
+
+    local_pid = pid // num_xcds
+    chunk_idx = local_pid // chunk_size
+    pos_in_chunk = local_pid % chunk_size
+
+    xcd = pid % num_xcds
+    new_pid = chunk_idx * num_xcds * chunk_size + xcd * chunk_size + pos_in_chunk
+    return new_pid
+
+@triton_dist.jit()
+def persistent_all_reduce_ring(
+    input_ptr,
+    output_ptr,
+    ring_buffer,
+    flags,
+    M,
+    N,
+    stride_in_m,
+    stride_in_n,
+    stride_out_m,
+    stride_out_n,
+    group_rank: tl.constexpr,
+    iris_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    rank_start: tl.constexpr,
+    rank_stride: tl.constexpr,
+    next_rank: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    NUM_RINGS: tl.constexpr,
+    SLICE_SIZE_N: tl.constexpr,
+    FLAGS_PER_TILE: tl.constexpr,
+):
+    """
+    Ring-based all-reduce kernel that streams whole tiles around the ring using a
+    single-buffer, producer/consumer handshake.
+
+    Each rank keeps a running accumulator for its local tile, forwards the tile it
+    just received to its successor, and consumes the predecessor's contribution in
+    lock-step.  After (world_size - 1) hops every rank has seen all partial tiles,
+    so the accumulator holds the fully reduced result which is written back locally.
+    """
+    pid_raw = tl.program_id(0)
+    COMM_SMS = tl.num_programs(0)
+
+    # Use chiplet transform to distribute program IDs across XCDs
+    pid = pid_raw
+    if NUM_XCDS != 1:
+        pid = chiplet_transform_chunked(pid_raw, COMM_SMS, NUM_XCDS, CHUNK_SIZE)
+
+    tl.static_assert(NUM_RINGS > 0, "NUM_RINGS must be >= 1")
+    tl.static_assert(FLAGS_PER_TILE >= 1, "FLAGS_PER_TILE must be at least 1")
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     total_tiles = num_pid_m * num_pid_n
 
-    # Tiles this rank owns: my_pe, my_pe+ws, ...  The COMM_SMS persistent
-    # programs split the owned tiles among themselves (grid-stride).
-    remaining = tl.maximum(total_tiles - my_pe, 0)
-    n_owned = tl.cdiv(remaining, ws)
+    # Ring topology: next_rank is passed in from Python side
+    # for group support
 
-    for k in range(pid, n_owned, COMM_SMS):
-        tile_id = my_pe + k * ws
+    acc_dtype = tl.float32 if output_ptr.type.element_ty != tl.int8 else tl.int32
+    elem_ty = input_ptr.type.element_ty
 
-        # GROUP_SIZE_M swizzle -> (pid_m, pid_n) for receiver-side L2 locality
-        # (same swizzle the push all-gather uses).
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = tile_id // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
+    # Partition CTAs across rings to form NUM_RINGS concurrent rings.
+    ctas_per_ring = (COMM_SMS + NUM_RINGS - 1) // NUM_RINGS
+    ring_id = pid % NUM_RINGS
+    cta_in_ring = pid // NUM_RINGS
 
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        offsets = offs_m[:, None] * stride_m + offs_n[None, :]
+    if (cta_in_ring < ctas_per_ring) and (total_tiles > 0) and (total_tiles > ring_id):
+        tiles_per_ring = (total_tiles - ring_id + NUM_RINGS - 1) // NUM_RINGS
+        for tile_index_in_ring in range(cta_in_ring, tiles_per_ring, ctas_per_ring):
+            tile_id = ring_id + tile_index_in_ring * NUM_RINGS
+            if tile_id < total_tiles:
+                num_pid_in_group = GROUP_SIZE_M * num_pid_n
+                group_id = tile_id // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+                pid_n = (tile_id % num_pid_in_group) // group_size_m
 
-        # Reduce: sum this tile across every peer's input, in fp32 registers.
-        # Rotating the start peer by my_pe staggers receive-side read traffic.
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for i in tl.static_range(0, ws):
-            peer = (my_pe + 1 + i) % ws
-            peer_x = dl.symm_at(x_ptr, peer)
-            acc += tl.load(peer_x + offsets, mask=mask, other=0.0).to(tl.float32)
-        reduced = acc.to(y_ptr.dtype.element_ty)
+                tl.assume(pid_m >= 0)
+                tl.assume(pid_n >= 0)
 
-        # Scatter: write the reduced tile locally (write-through) and push it
-        # into every peer's output.
-        tl.store(y_ptr + offsets, reduced, mask=mask, cache_modifier=".wt")
-        for i in tl.static_range(0, ws):
-            peer = (my_pe + 1 + i) % ws
-            if peer != my_pe:
-                peer_y = dl.symm_at(y_ptr, peer)
-                tl.store(peer_y + offsets, reduced, mask=mask)
+                rm_base = pid_m * BLOCK_SIZE_M
+                rn_base = pid_n * BLOCK_SIZE_N
+                rm = rm_base + tl.arange(0, BLOCK_SIZE_M)
+                rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
+
+                rn = rn_base + tl.arange(0, BLOCK_SIZE_N)
+                mask = (rm[:, None] < M) & (rn[None, :] < N)
+                tile_offset = rm[:, None] * stride_in_m + rn[None, :] * stride_in_n
+
+                local_tile = tl.load(input_ptr + tile_offset, mask=mask, other=0)
+                acc = local_tile.to(acc_dtype)
+                send_data = local_tile
+
+                flag_offset = tile_id * FLAGS_PER_TILE
+                remote_flag_ptr = flags + flag_offset
+                local_flag_ptr = flags + flag_offset
+                remote_flag_ptr = dl.symm_at(remote_flag_ptr, next_rank)
+
+                for _step in range(0, world_size - 1):
+                    libshmem_device.signal_wait_until(
+                        remote_flag_ptr, 
+                        libshmem_device.ROCSHMEM_CMP_EQ,
+                        0
+                    )
+
+                    dest_ptr = dl.symm_at(ring_buffer, next_rank)
+                    tl.store(dest_ptr + tile_offset, send_data, mask=mask)
+
+                    tl.debug_barrier()
+                    tl.atomic_xchg(remote_flag_ptr, 1, 
+                        sem="release",
+                        scope="sys")
+
+                    zero = tl.cast(0, tl.uint64)
+                    while tl.atomic_cas(local_flag_ptr, zero, zero, sem="acquire", scope="sys") != tl.cast(1, tl.uint64):
+                        pass
+
+                    recv_tile = tl.load(ring_buffer + tile_offset, mask=mask, other=0)
+                    acc += recv_tile.to(acc_dtype)
+                    send_data = recv_tile
+                    tl.debug_barrier()
+                    tl.atomic_xchg(local_flag_ptr, 0, sem="release", scope="sys")
+
+                tl.store(
+                    output_ptr + tile_offset,
+                    acc.to(output_ptr.type.element_ty),
+                    mask=mask,
+                )
 
 
 def allreduce_one_shot_push_intra_node(
@@ -713,20 +787,29 @@ def allreduce_two_shot_push_intra_node(
     # )
 
     # Copy from non-symmetric memory to symmetric memory. The iris-based kernels don't do this for you.
-    hip.hipMemcpy(
-        ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2],
-        x.data_ptr(),
-        x.nbytes,
-        hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
-    )
-    pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
-
-    extra_dim = 8
-    assert num_elem % extra_dim == 0, "Bad dimension"
+    # hip.hipMemcpy(
+    #     ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2],
+    #     x.data_ptr(),
+    #     x.nbytes,
+    #     hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
+    # )
+    # pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
+    # torch.cuda.synchronize()
+    try_dims = [16, 8]
+    extra_dim = None
+    for d in try_dims:
+        if num_elem % d == 0:
+            extra_dim = d
+            break
+    # extra_dim = 16
+    # assert num_elem % extra_dim == 0, "Bad dimension"
+    assert extra_dim is not None, "Bad dimension"
     reshape_2d = (num_elem // extra_dim, extra_dim)
-    input_buf = ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2].view(dtype=x.dtype).view(reshape_2d)
-    output_buf = ctx.symm_scatter_buf[:x.nbytes].view(dtype=x.dtype).view(reshape_2d)
+    # input_buf = ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2].view(dtype=x.dtype).view(reshape_2d)
+    # output_buf = ctx.symm_scatter_buf[:x.nbytes].view(dtype=x.dtype).view(reshape_2d)
+    input_buf = x.view(reshape_2d)
+    output_buf = output.view(reshape_2d)
+
     # persistent_all_reduce_two_shot[(num_tiles, )](
     #     input_buf,
     #     output_buf,
@@ -743,31 +826,49 @@ def allreduce_two_shot_push_intra_node(
     #     1,
     #     block_size // extra_dim,
     #     extra_dim,
-    #     4,
-    #     0
+    #     ctx.swizzle_size,
+    #     0 # DISTRIBUTION
     # )
-    allreduce_twoshot_fused_kernel[(num_tiles, )](
+
+    chunk_size = ctx.swizzle_size * ctx.swizzle_size
+    chunk_size = min(chunk_size, num_tiles // ctx.num_xcds)
+    
+    persistent_all_reduce_ring[(num_tiles, )](
         input_buf,
         output_buf,
+        ctx.symm_scatter_buf.view(dtype=x.dtype),
+        ctx.symm_signal,
         input_buf.shape[0],
         input_buf.shape[1],
         input_buf.stride(0),
+        input_buf.stride(1),
+        output_buf.stride(0),
+        output_buf.stride(1),
+        ctx.rank,
         ctx.rank,
         ctx.world_size,
-        num_tiles,
+        0,
+        1,
+        (ctx.rank + 1) % ctx.world_size, # next_rank,
         block_size // extra_dim,
         extra_dim,
-        4,
+        ctx.swizzle_size, # GROUP_SIZE_M
+        ctx.num_xcds, # num_xcds
+        chunk_size,
+        1, # num_rings,
+        extra_dim // ctx.world_size, # slice_size_n
+        1, # flags_per_tile
     )
-    pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
-    torch.cuda.synchronize()
 
-    hip.hipMemcpy(
-        output.data_ptr(), 
-        ctx.symm_scatter_buf[:x.nbytes],
-        x.nbytes,
-        hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
-    )
+    # pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
+    # torch.cuda.synchronize()
+
+    # hip.hipMemcpy(
+    #     output.data_ptr(), 
+    #     ctx.symm_scatter_buf[:x.nbytes],
+    #     x.nbytes,
+    #     hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
+    # )
 
     return output
 

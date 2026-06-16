@@ -40,6 +40,9 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import triton
+import pyrocshmem
+import statistics
+from hip import hip
 
 from triton_dist.kernels.allreduce import AllReduceMethod, to_allreduce_method
 from triton_dist.kernels.amd.allreduce import all_reduce, create_allreduce_ctx
@@ -54,16 +57,26 @@ from triton_dist.utils import (
 
 _AMD_METHODS = ("one_shot", "two_shot")
 
+# DATA_SIZES = [
+#     128,
+#     1024,
+#     16 * 1024,
+#     32 * 1024,
+#     64 * 1024,
+#     128 * 1024,
+#     256 * 1024,
+#     512 * 1024,
+#     1024 * 1024,
+#     2 * 1024 * 1024,
+#     4 * 1024 * 1024,
+#     8 * 1024 * 1024,
+#     16 * 1024 * 1024,
+#     32 * 1024 * 1024,
+#     64 * 1024 * 1024,
+#     128 * 1024 * 1024,
+# ]
+
 DATA_SIZES = [
-    128,
-    1024,
-    16 * 1024,
-    32 * 1024,
-    64 * 1024,
-    128 * 1024,
-    256 * 1024,
-    512 * 1024,
-    1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
     8 * 1024 * 1024,
@@ -71,6 +84,9 @@ DATA_SIZES = [
     32 * 1024 * 1024,
     64 * 1024 * 1024,
     128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    # 512 * 1024 * 1024,
+    # 1024 * 1024 * 1024,
 ]
 
 
@@ -202,10 +218,16 @@ def run_perf(dtype: torch.dtype, method: AllReduceMethod, warmup=5, iters=10):
         if method == AllReduceMethod.TwoShot and num_elem % WORLD_SIZE != 0:
             continue
         local_input = _create_data(num_elem, dtype=dtype)
+        triton_in_buf = pyrocshmem.rocshmem_create_tensor(local_input.shape, local_input.dtype)
+        triton_out_buf = pyrocshmem.rocshmem_create_tensor(local_input.shape, local_input.dtype)
+        hip.hipMemcpy(triton_in_buf, local_input, local_input.nbytes, hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU)
+        hip.hipMemcpy(triton_out_buf, local_input, local_input.nbytes, hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU)
+        pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
         rccl_buf = local_input.clone()
 
         def allreduce_op():
-            all_reduce(local_input, method=method, ctx=ctx)
+            all_reduce(triton_in_buf, output=triton_out_buf, method=method, ctx=ctx)
 
         sleep_async(100)
         _, triton_ms = perf_func(allreduce_op, warmup_iters=warmup, iters=iters)
@@ -228,19 +250,25 @@ def run_perf(dtype: torch.dtype, method: AllReduceMethod, warmup=5, iters=10):
                 f"{triton_hw:12.2f}  {rccl_hw:12.2f}  {triton_ms * 1000:14.2f}  {rccl_ms * 1000:14.2f}"
             )
 
+        del triton_in_buf
+        del triton_out_buf
+
     ctx.finalize()
 
     if RANK == 0 and ratio_samples:
         mean_ratio = sum(ratio_samples) / len(ratio_samples)
+        geomean = statistics.geometric_mean(ratio_samples)
         if mean_ratio > 1.0:
             print(
                 f"\nSummary: mean algorithm-bandwidth ratio Triton/RCCL = {mean_ratio:.3f} "
+                f"geomean = {geomean:.3f} "
                 f"over {len(ratio_samples)} sizes (Triton higher by ~{mean_ratio:.2f}x on average)."
             )
         elif mean_ratio < 1.0:
             inv = 1.0 / mean_ratio
             print(
                 f"\nSummary: mean algorithm-bandwidth ratio Triton/RCCL = {mean_ratio:.3f} "
+                f"geomean = {geomean:.3f} "
                 f"over {len(ratio_samples)} sizes (RCCL higher by ~{inv:.2f}x on average)."
             )
         else:
