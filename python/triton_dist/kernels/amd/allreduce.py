@@ -61,7 +61,7 @@ def workspace_bytes_per_in_byte(world_size, method: AllReduceMethod) -> int:
     if method in [AllReduceMethod.OneShot, AllReduceMethod.OneShot_TMA]:
         return world_size
     if method in [AllReduceMethod.TwoShot]:
-        return 2
+        return 1
     if method in [
             AllReduceMethod.OneShot_Multimem,
             AllReduceMethod.TwoShot_Multimem,
@@ -547,160 +547,6 @@ def persistent_all_reduce_two_shot(
                     out_rank_ptr = dl.symm_at(output_ptr, remote_rank) + output_offset
                     tl.store(out_rank_ptr, reduced, mask=mask)
 
-@triton_dist.jit()
-def chiplet_transform_chunked(pid, num_workgroups: tl.constexpr, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
-    """
-    Transform program ID for chiplet-aware workgroup distribution.
-
-    This function redistributes workgroups across multiple XCDs (chiplets) in chunks
-    to improve load balancing and memory access patterns.
-
-    Args:
-        pid: Program ID to transform
-        num_workgroups: Total number of workgroups
-        num_xcds: Number of XCDs (chiplets)
-        chunk_size: Size of chunks for distribution
-
-    Returns:
-        Transformed program ID
-    """
-    if pid > (num_workgroups // (num_xcds * chunk_size)) * (num_xcds * chunk_size):
-        return pid
-
-    local_pid = pid // num_xcds
-    chunk_idx = local_pid // chunk_size
-    pos_in_chunk = local_pid % chunk_size
-
-    xcd = pid % num_xcds
-    new_pid = chunk_idx * num_xcds * chunk_size + xcd * chunk_size + pos_in_chunk
-    return new_pid
-
-@triton_dist.jit()
-def persistent_all_reduce_ring(
-    input_ptr,
-    output_ptr,
-    ring_buffer,
-    flags,
-    M,
-    N,
-    stride_in_m,
-    stride_in_n,
-    stride_out_m,
-    stride_out_n,
-    group_rank: tl.constexpr,
-    iris_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    rank_start: tl.constexpr,
-    rank_stride: tl.constexpr,
-    next_rank: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
-    CHUNK_SIZE: tl.constexpr,
-    NUM_RINGS: tl.constexpr,
-    SLICE_SIZE_N: tl.constexpr,
-    FLAGS_PER_TILE: tl.constexpr,
-):
-    """
-    Ring-based all-reduce kernel that streams whole tiles around the ring using a
-    single-buffer, producer/consumer handshake.
-
-    Each rank keeps a running accumulator for its local tile, forwards the tile it
-    just received to its successor, and consumes the predecessor's contribution in
-    lock-step.  After (world_size - 1) hops every rank has seen all partial tiles,
-    so the accumulator holds the fully reduced result which is written back locally.
-    """
-    pid_raw = tl.program_id(0)
-    COMM_SMS = tl.num_programs(0)
-
-    # Use chiplet transform to distribute program IDs across XCDs
-    pid = pid_raw
-    if NUM_XCDS != 1:
-        pid = chiplet_transform_chunked(pid_raw, COMM_SMS, NUM_XCDS, CHUNK_SIZE)
-
-    tl.static_assert(NUM_RINGS > 0, "NUM_RINGS must be >= 1")
-    tl.static_assert(FLAGS_PER_TILE >= 1, "FLAGS_PER_TILE must be at least 1")
-
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    total_tiles = num_pid_m * num_pid_n
-
-    # Ring topology: next_rank is passed in from Python side
-    # for group support
-
-    acc_dtype = tl.float32 if output_ptr.type.element_ty != tl.int8 else tl.int32
-    elem_ty = input_ptr.type.element_ty
-
-    # Partition CTAs across rings to form NUM_RINGS concurrent rings.
-    ctas_per_ring = (COMM_SMS + NUM_RINGS - 1) // NUM_RINGS
-    ring_id = pid % NUM_RINGS
-    cta_in_ring = pid // NUM_RINGS
-
-    if (cta_in_ring < ctas_per_ring) and (total_tiles > 0) and (total_tiles > ring_id):
-        tiles_per_ring = (total_tiles - ring_id + NUM_RINGS - 1) // NUM_RINGS
-        for tile_index_in_ring in range(cta_in_ring, tiles_per_ring, ctas_per_ring):
-            tile_id = ring_id + tile_index_in_ring * NUM_RINGS
-            if tile_id < total_tiles:
-                num_pid_in_group = GROUP_SIZE_M * num_pid_n
-                group_id = tile_id // num_pid_in_group
-                first_pid_m = group_id * GROUP_SIZE_M
-                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-                pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-                pid_n = (tile_id % num_pid_in_group) // group_size_m
-
-                tl.assume(pid_m >= 0)
-                tl.assume(pid_n >= 0)
-
-                rm_base = pid_m * BLOCK_SIZE_M
-                rn_base = pid_n * BLOCK_SIZE_N
-                rm = rm_base + tl.arange(0, BLOCK_SIZE_M)
-                rm = tl.max_contiguous(tl.multiple_of(rm, BLOCK_SIZE_M), BLOCK_SIZE_M)
-
-                rn = rn_base + tl.arange(0, BLOCK_SIZE_N)
-                mask = (rm[:, None] < M) & (rn[None, :] < N)
-                tile_offset = rm[:, None] * stride_in_m + rn[None, :] * stride_in_n
-
-                local_tile = tl.load(input_ptr + tile_offset, mask=mask, other=0)
-                acc = local_tile.to(acc_dtype)
-                send_data = local_tile
-
-                flag_offset = tile_id * FLAGS_PER_TILE
-                remote_flag_ptr = flags + flag_offset
-                local_flag_ptr = flags + flag_offset
-                remote_flag_ptr = dl.symm_at(remote_flag_ptr, next_rank)
-
-                for _step in range(0, world_size - 1):
-                    libshmem_device.signal_wait_until(
-                        remote_flag_ptr, 
-                        libshmem_device.ROCSHMEM_CMP_EQ,
-                        0
-                    )
-
-                    dest_ptr = dl.symm_at(ring_buffer, next_rank)
-                    tl.store(dest_ptr + tile_offset, send_data, mask=mask)
-
-                    tl.debug_barrier()
-                    tl.atomic_xchg(remote_flag_ptr, 1, 
-                        sem="release",
-                        scope="sys")
-
-                    zero = tl.cast(0, tl.uint64)
-                    while tl.atomic_cas(local_flag_ptr, zero, zero, sem="acquire", scope="sys") != tl.cast(1, tl.uint64):
-                        pass
-
-                    recv_tile = tl.load(ring_buffer + tile_offset, mask=mask, other=0)
-                    acc += recv_tile.to(acc_dtype)
-                    send_data = recv_tile
-                    tl.debug_barrier()
-                    tl.atomic_xchg(local_flag_ptr, 0, sem="release", scope="sys")
-
-                tl.store(
-                    output_ptr + tile_offset,
-                    acc.to(output_ptr.type.element_ty),
-                    mask=mask,
-                )
-
 
 def allreduce_one_shot_push_intra_node(
     ctx: AllReduceContext,
@@ -759,85 +605,30 @@ def allreduce_two_shot_push_intra_node(
         assert x.dtype == output.dtype and x.nbytes == output.nbytes
     else:
         output = torch.empty_like(x)
-    assert x.nbytes <= ctx.workspace_nbytes // 2
 
-    block_size = num_warps * 64 * 16 // x.itemsize
+    block_size = num_warps * 16 * 16 // x.itemsize
     num_elem = x.numel()
     num_tiles = triton.cdiv(num_elem, block_size)
     _run_straggler(ctx, straggler_option)
     if max_sm > 0:
         num_tiles = min(max_sm, num_tiles)
     num_tiles = max(ctx.world_size, min(get_device_property().multi_processor_count, num_tiles))
-    dev_ctx = pyrocshmem.rocshmem_get_device_ctx()
 
-    # allreduce_two_shot_push_intra_node_kernel[(num_tiles, )](
-    #     dev_ctx,
-    #     x,
-    #     ctx.symm_scatter_buf,
-    #     ctx.symm_signal,
-    #     ctx.grid_barrier,
-    #     output,
-    #     ctx.rank,
-    #     ctx.world_size,
-    #     num_elem,
-    #     BLOCK_SIZE=block_size,
-    #     num_warps=num_warps,
-    #     use_cooperative=False,
-    #     **launch_cooperative_grid_options(),
-    # )
-
-    # Copy from non-symmetric memory to symmetric memory. The iris-based kernels don't do this for you.
-    # hip.hipMemcpy(
-    #     ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2],
-    #     x.data_ptr(),
-    #     x.nbytes,
-    #     hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
-    # )
-    # pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
-    # torch.cuda.synchronize()
-    try_dims = [16, 8]
+    try_dims = [64, 32, 16, 8]
     extra_dim = None
     for d in try_dims:
         if num_elem % d == 0:
             extra_dim = d
             break
-    # extra_dim = 16
-    # assert num_elem % extra_dim == 0, "Bad dimension"
+
     assert extra_dim is not None, "Bad dimension"
     reshape_2d = (num_elem // extra_dim, extra_dim)
-    # input_buf = ctx.symm_scatter_buf[x.nbytes:x.nbytes * 2].view(dtype=x.dtype).view(reshape_2d)
-    # output_buf = ctx.symm_scatter_buf[:x.nbytes].view(dtype=x.dtype).view(reshape_2d)
     input_buf = x.view(reshape_2d)
     output_buf = output.view(reshape_2d)
 
-    # persistent_all_reduce_two_shot[(num_tiles, )](
-    #     input_buf,
-    #     output_buf,
-    #     input_buf.shape[0],
-    #     input_buf.shape[1],
-    #     input_buf.stride(0),
-    #     input_buf.stride(1),
-    #     output_buf.stride(0),
-    #     output_buf.stride(1),
-    #     ctx.rank,
-    #     ctx.rank,
-    #     ctx.world_size,
-    #     0,
-    #     1,
-    #     block_size // extra_dim,
-    #     extra_dim,
-    #     ctx.swizzle_size,
-    #     0 # DISTRIBUTION
-    # )
-
-    chunk_size = ctx.swizzle_size * ctx.swizzle_size
-    chunk_size = min(chunk_size, num_tiles // ctx.num_xcds)
-    
-    persistent_all_reduce_ring[(num_tiles, )](
+    persistent_all_reduce_two_shot[(num_tiles, )](
         input_buf,
         output_buf,
-        ctx.symm_scatter_buf.view(dtype=x.dtype),
-        ctx.symm_signal,
         input_buf.shape[0],
         input_buf.shape[1],
         input_buf.stride(0),
@@ -849,26 +640,11 @@ def allreduce_two_shot_push_intra_node(
         ctx.world_size,
         0,
         1,
-        (ctx.rank + 1) % ctx.world_size, # next_rank,
         block_size // extra_dim,
         extra_dim,
-        ctx.swizzle_size, # GROUP_SIZE_M
-        ctx.num_xcds, # num_xcds
-        chunk_size,
-        1, # num_rings,
-        extra_dim // ctx.world_size, # slice_size_n
-        1, # flags_per_tile
+        ctx.swizzle_size,
+        0 # DISTRIBUTION
     )
-
-    # pyrocshmem.rocshmem_barrier_all_on_stream(torch.cuda.current_stream().cuda_stream)
-    # torch.cuda.synchronize()
-
-    # hip.hipMemcpy(
-    #     output.data_ptr(), 
-    #     ctx.symm_scatter_buf[:x.nbytes],
-    #     x.nbytes,
-    #     hip.hipMemcpyKind.hipMemcpyDeviceToDeviceNoCU
-    # )
 
     return output
 
